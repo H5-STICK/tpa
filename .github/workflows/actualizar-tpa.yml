@@ -1,0 +1,154 @@
+
+name: Actualizar TPA
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actualizar-tpa
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Renovar enlace TPA
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          import json
+          import base64
+          import html
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          pagina = "https://www.rtpa.es/tpa-television"
+          referer = pagina
+
+          solicitud = urllib.request.Request(
+              pagina,
+              headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "text/html"
+              }
+          )
+
+          with urllib.request.urlopen(
+              solicitud, timeout=30
+          ) as respuesta:
+              contenido = respuesta.read().decode(
+                  "utf-8", errors="replace"
+              )
+
+          enlaces = re.findall(
+              r'https?[^"\'\s<>]*watchity[^"\'\s<>]*',
+              contenido
+          )
+
+          candidatos = []
+
+          for enlace in enlaces:
+              enlace = html.unescape(enlace)
+              enlace = enlace.replace("\\/", "/")
+
+              if not enlace.endswith("/index.m3u8"):
+                  continue
+
+              try:
+                  token = enlace.split(
+                      "/token/", 1
+                  )[1].split("/", 1)[0]
+
+                  payload = token.split(".")[1]
+                  payload += "=" * (-len(payload) % 4)
+
+                  datos = json.loads(
+                      base64.urlsafe_b64decode(payload)
+                  )
+
+                  caducidad = int(datos["exp"])
+
+                  if caducidad > time.time() + 3600:
+                      candidatos.append(
+                          (caducidad, enlace)
+                      )
+
+              except Exception:
+                  continue
+
+          if not candidatos:
+              raise RuntimeError(
+                  "No se encontro un token valido de TPA"
+              )
+
+          caducidad, enlace = max(candidatos)
+
+          prueba = urllib.request.Request(
+              enlace,
+              headers={
+                  "User-Agent": "Mozilla/5.0",
+                  "Referer": referer,
+                  "Origin": "https://www.rtpa.es"
+              }
+          )
+
+          with urllib.request.urlopen(
+              prueba, timeout=30
+          ) as respuesta:
+              datos = respuesta.read(4096)
+
+              if respuesta.status != 200:
+                  raise RuntimeError(
+                      "Watchity no devuelve HTTP 200"
+                  )
+
+              if not datos.startswith(b"#EXTM3U"):
+                  raise RuntimeError(
+                      "La respuesta no es una lista M3U8"
+                  )
+
+          print("TPA: enlace verificado")
+          print("Caducidad:", caducidad)
+
+          playlist = (
+              "#EXTM3U\n"
+              "#EXTINF:-1,TPA Asturias\n"
+              "#EXTVLCOPT:http-referrer="
+              "https://www.rtpa.es/tpa-television\n"
+              f"{enlace}\n"
+          )
+
+          Path("tpa.m3u8").write_text(
+              playlist,
+              encoding="utf-8"
+          )
+
+          print("tpa.m3u8 actualizado")
+          PY
+
+      - name: Publicar cambios
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add tpa.m3u8
+
+          if git diff --cached --quiet; then
+            echo "No hay cambios"
+          else
+            git commit -m "Renovar enlace TPA"
+            git push
+          fi
